@@ -1,17 +1,29 @@
-import asyncio, time, random, json, threading
-from collections import defaultdict, deque
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import asyncio
+import json
+import threading
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="DAG Workflow Engine")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+from .engine import build_run, compute_stats, execute_run
 
-ACTIVE_CLIENTS = []
-WORKFLOW_ID = 0
+app = FastAPI(title="DAG Workflow Engine")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
+
+ACTIVE_CLIENTS = []          # [WebSocket]
+MAIN_LOOP = None             # 主事件循环，工作线程推送 WS 必须用它
+WORKFLOWS = {}               # id -> workflow 定义
+RUNS = {}                    # run_id -> run 快照
+RUN_ORDER = []               # run_id 时间顺序
+MAX_RUN_HISTORY = 20
+
 
 class WorkflowCreate(BaseModel):
     name: str = "data-pipeline"
+
 
 class RunRequest(BaseModel):
     workflowId: int
@@ -20,7 +32,7 @@ class RunRequest(BaseModel):
 
 
 def generate_dag_workflow(name: str):
-    """Create a realistic DAG pipeline"""
+    """创建数据处理流水线 DAG 定义。"""
     nodes = [
         {"id": "extract", "name": "数据提取", "deps": [], "duration": 2.0},
         {"id": "validate", "name": "数据校验", "deps": ["extract"], "duration": 1.5},
@@ -41,144 +53,129 @@ def generate_dag_workflow(name: str):
     for i, n in enumerate(nodes):
         n["x"] = positions[i][0] * 2.5 + 2.5
         n["y"] = positions[i][1] * 0.9
-        n["status"] = "PENDING"
-        n["retries"] = 0
-        n["startTime"] = None
-        n["endTime"] = None
-
     edges = []
     for n in nodes:
         for d in n["deps"]:
             edges.append([d, n["id"]])
+    return {"name": name, "nodes": nodes, "edges": edges}
 
-    return {"nodes": [{
-        "id": n["id"], "name": n["name"], "deps": n["deps"],
-        "x": n["x"], "y": n["y"], "status": n["status"],
-        "startTime": None, "endTime": None, "retries": n["retries"]
-    } for n in nodes], "edges": edges, "durations": {n["id"]: n["duration"] for n in nodes}}
+
+@app.on_event("startup")
+def _capture_loop():
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_event_loop()
 
 
 @app.post("/api/workflow")
 def create_workflow(req: WorkflowCreate):
-    global WORKFLOW_ID
-    WORKFLOW_ID += 1
+    wf_id = max(WORKFLOWS, default=0) + 1
     dag = generate_dag_workflow(req.name)
-    return {"id": WORKFLOW_ID, "name": req.name, "nodes": dag["nodes"], "edges": dag["edges"],
-            "_durations": dag["durations"]}
+    WORKFLOWS[wf_id] = dag
+    return {"id": wf_id, "name": dag["name"],
+            "nodes": dag["nodes"], "edges": dag["edges"]}
+
+
+def run_snapshot(run):
+    """生成对外快照：每次都是独立拷贝，历史运行不会被后续运行改写。"""
+    return {
+        "runId": run["id"],
+        "name": run["name"],
+        "status": run["status"],
+        "completed": run["completed"],
+        "startedAt": run["startedAt"],
+        "finishedAt": run["finishedAt"],
+        "maxAttempts": run["maxAttempts"],
+        "workflow": {
+            "id": run["id"],
+            "name": run["name"],
+            "nodes": [dict(n) for n in run["nodes"]],
+            "edges": [list(e) for e in run["edges"]],
+        },
+        "stats": run.get("stats", compute_stats(run)),
+        "logs": run["logs"][-200:],
+        "circuitBreakers": [
+            {"taskId": tid,
+             "failureCount": cb["failureCount"], "state": cb["state"],
+             "cooldownUntil": cb["cooldownUntil"], "terminal": cb["terminal"]}
+            for tid, cb in run["breakers"].items()
+        ],
+    }
+
+
+def broadcast(run):
+    if MAIN_LOOP is None or not ACTIVE_CLIENTS:
+        return
+    payload = json.dumps(run_snapshot(run))
+    dead = []
+    for ws in list(ACTIVE_CLIENTS):
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_text(payload), MAIN_LOOP)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)
 
 
 @app.post("/api/run")
 def run_workflow(req: RunRequest):
-    dag = generate_dag_workflow("workflow")
-    t = threading.Thread(target=execute_workflow, args=(dag, req.workers, req.strategy), daemon=True)
-    t.start()
-    return {
-        "workflow": {"id": req.workflowId, "name": "workflow", "nodes": dag["nodes"], "edges": dag["edges"]},
-        "logs": [], "circuitBreakers": [], "completed": False
-    }
+    if req.workflowId not in WORKFLOWS:
+        raise HTTPException(404, "workflow not found")
+    run_id = max(RUN_ORDER, default=0) + 1
+    dag = WORKFLOWS[req.workflowId]
+    run = build_run(run_id, dag, dag["name"])
+    RUNS[run_id] = run
+    RUN_ORDER.append(run_id)
+    if len(RUN_ORDER) > MAX_RUN_HISTORY:
+        old = RUN_ORDER.pop(0)
+        RUNS.pop(old, None)
+
+    thread = threading.Thread(
+        target=execute_run,
+        kwargs={"run": run, "workers": req.workers, "on_update": broadcast},
+        daemon=True)
+    thread.start()
+    return run_snapshot(run)
 
 
-def execute_workflow(dag, workers, strategy):
-    nodes = dag["nodes"]
-    durations = dag["durations"]
-    edges = dag["edges"]
-    in_degree = defaultdict(int)
-    adj = defaultdict(list)
-    for u, v in edges:
-        in_degree[v] += 1
-        adj[u].append(v)
+@app.get("/api/runs")
+def list_runs():
+    items = []
+    for rid in reversed(RUN_ORDER):
+        r = RUNS[rid]
+        items.append({
+            "runId": rid, "name": r["name"], "status": r["status"],
+            "completed": r["completed"], "startedAt": r["startedAt"],
+            "finishedAt": r["finishedAt"],
+        })
+    return items
 
-    # BFS topological sort
-    ready = deque([n["id"] for n in nodes if in_degree[n["id"]] == 0])
-    node_map = {n["id"]: n for n in nodes}
-    logs = []
-    cb_state = defaultdict(lambda: {"failureCount": 0, "state": "CLOSED", "cooldownUntil": 0})
-    failure_threshold = 3
-    running_tasks = {}
-    completed = set()
 
-    def send_update(completed_flag=False):
-        payload = {
-            "workflow": {"id": 1, "name": "workflow", "nodes": nodes, "edges": edges},
-            "logs": logs[-30:],
-            "circuitBreakers": [{"taskId": k, **v} for k, v in cb_state.items()],
-            "completed": completed_flag
-        }
-        for ws in ACTIVE_CLIENTS:
-            try: asyncio.run_coroutine_threadsafe(ws.send_text(json.dumps(payload)), asyncio.get_event_loop())
-            except: pass
-        time.sleep(0.3)
-
-    while ready or running_tasks:
-        # Start tasks
-        while ready and len(running_tasks) < workers:
-            tid = ready.popleft()
-            node = node_map[tid]
-            cb = cb_state[tid]
-            if cb["state"] == "OPEN" and time.time() < cb["cooldownUntil"]:
-                ready.appendleft(tid)
-                continue
-            if cb["state"] == "OPEN":
-                cb["state"] = "HALF_OPEN"
-
-            node["status"] = "RUNNING"
-            node["startTime"] = time.time()
-
-            # Simulate task execution (random success/failure)
-            will_fail = random.random() < 0.12  # 12% failure rate
-            runtime = durations.get(tid, 1.5) * random.uniform(0.7, 1.3)
-            running_tasks[tid] = {
-                "end_time": time.time() + runtime,
-                "will_fail": will_fail,
-                "retries": node["retries"]
-            }
-            logs.append({"taskId": tid, "status": "RUNNING", "timestamp": time.time(), "message": f"开始执行 {node['name']}"})
-
-        # Check completed tasks
-        now = time.time()
-        finished = []
-        for tid, info in running_tasks.items():
-            if now >= info["end_time"]:
-                node = node_map[tid]
-                if info["will_fail"] and node["retries"] < 3:
-                    node["retries"] += 1
-                    node["status"] = "PENDING"
-                    ready.appendleft(tid)
-                    cb = cb_state[tid]
-                    cb["failureCount"] += 1
-                    logs.append({"taskId": tid, "status": "FAILED", "timestamp": now, "message": f"重试 {node['retries']}/3"})
-                    if cb["failureCount"] >= failure_threshold:
-                        cb["state"] = "OPEN"
-                        cb["cooldownUntil"] = now + 5
-                        logs.append({"taskId": tid, "status": "CIRCUIT_OPEN", "timestamp": now, "message": f"熔断! {failure_threshold}次连续失败"})
-                else:
-                    node["status"] = "SUCCESS"
-                    node["endTime"] = now
-                    completed.add(tid)
-                    cb_state[tid]["failureCount"] = 0
-                    cb_state[tid]["state"] = "CLOSED"
-                    logs.append({"taskId": tid, "status": "SUCCESS", "timestamp": now, "message": f"完成 {node['name']}"})
-                    for next_tid in adj[tid]:
-                        in_degree[next_tid] -= 1
-                        if in_degree[next_tid] == 0:
-                            ready.append(next_tid)
-                finished.append(tid)
-
-        for tid in finished:
-            del running_tasks[tid]
-
-        send_update()
-        if len(completed) == len(nodes):
-            break
-
-    send_update(True)
+@app.get("/api/runs/{run_id}")
+def get_run(run_id: int):
+    run = RUNS.get(run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+    return run_snapshot(run)
 
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     ACTIVE_CLIENTS.append(ws)
+    # 连上后立刻推送所有已知运行（含历史），页面刷新即可回看
     try:
-        while True: await ws.receive_text()
-    except:
-        if ws in ACTIVE_CLIENTS: ACTIVE_CLIENTS.remove(ws)
+        for rid in reversed(RUN_ORDER):
+            await ws.send_text(json.dumps(run_snapshot(RUNS[rid])))
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)
+    except Exception:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
